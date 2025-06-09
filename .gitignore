@@ -1,0 +1,19 @@
+# Arquivo para ignorar arquivos sensíveis e desnecessários
+
+# Credenciais e variáveis de ambiente
+.env
+
+# Arquivos de cache do Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ambientes virtuais (se você usar um)
+venv/
+env/
+.venv/
+
+# Arquivos de IDEs
+.vscode/
+.idea/
