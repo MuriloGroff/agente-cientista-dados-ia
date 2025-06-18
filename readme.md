@@ -6,7 +6,8 @@ Este projeto é uma **aplicação web de análise de dados** construída com **S
 
 O objetivo é criar uma interface conversacional e intuitiva para a análise de dados, permitindo que usuários de negócio obtenham insights valiosos sem a necessidade de conhecimento técnico em SQL ou programação.
 
-*(Sugestão: Adicione aqui um GIF da sua aplicação em funcionamento!)*
+![image](https://github.com/user-attachments/assets/f138233a-37a4-47fc-ab0e-a7a1e712aaf2)
+
 
 ## ✨ Funcionalidades
 
