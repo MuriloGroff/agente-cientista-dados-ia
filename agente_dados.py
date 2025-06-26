@@ -11,6 +11,8 @@ import requests
 import base64
 import json
 import time
+from prophet import Prophet
+from prophet.plot import plot_plotly, plot_components_plotly
 
 # ... (após os imports)
 print(">>> DEBUG: Módulo agente_dados.py foi importado com sucesso.")
@@ -303,18 +305,37 @@ def gerar_sql_com_ia(pergunta_usuario: str, esquema_bd: dict) -> str:
 
     # Agora, criamos o prompt de Text-to-SQL
     prompt = f"""
-    Você é um especialista em MySQL. Sua tarefa é gerar uma única consulta SQL que responda à pergunta do usuário, com base no esquema do banco de dados fornecido.
+    Você é um especialista em MySQL. Sua tarefa é gerar uma ou mais consultas SQL para responder à pergunta do usuário.
 
     **Regras Importantes:**
-    - Retorne APENAS o código da consulta SQL.
-    - Não inclua explicações, comentários, ou a palavra "sql" antes do código.
-    - Use as tabelas e colunas exatamente como definidas no esquema.
-    - Priorize consultas SELECT. Nunca gere comandos INSERT, UPDATE ou DELETE.
-    - Para perguntas sobre datas como "ontem" ou "hoje", use as funções de data do MySQL como CURDATE() e INTERVAL. Por exemplo, para "ontem", use 'CURDATE() - INTERVAL 1 DAY'.
+    - Se a pergunta for uma comparação entre dois períodos, sua resposta DEVE ser um JSON contendo duas chaves: 'query_periodo_recente' e 'query_periodo_antigo'.
+    - Para perguntas simples, retorne APENAS o código SQL.
+    - Não inclua explicações ou comentários no SQL.
+    - Use as funções de data do MySQL como CURDATE() e INTERVAL para períodos como "hoje", "ontem", "mês passado".
+    - Para 'faturamento', use SUM(valorBase). Para 'quantidade de pedidos', use COUNT(DISTINCT numero). Para 'itens vendidos', use SUM(item_quantidade).
 
-    **Regras de Negócio:**
-    - Para calcular 'faturamento', sempre use a coluna 'valorBase' da tabela 'vendas_detalhes'.
-    - A coluna 'item_valor' representa o valor unitário do item, enquanto 'valorBase' é o valor a ser considerado para faturamento total.
+    - **REGRA DE OURO:** Todas as análises devem ser baseadas em dias completos. O 'dia atual' ou 'hoje' deve ser excluído. Para qualquer período que vá até o presente, use `CURDATE() - INTERVAL 1 DAY` como o último dia. Para "mês atual", o período deve ir do primeiro dia do mês até ontem.
+
+    **Exemplo para Pergunta Simples:**
+    Pergunta: "Qual o faturamento de ontem?"
+    Sua Resposta:
+    SELECT SUM(valorBase) FROM vendas_detalhes WHERE data = CURDATE() - INTERVAL 1 DAY;
+
+    **Regras de Negócio Específicas:**
+    - Para 'faturamento', use SUM(valorBase).
+    - 'Quantidade de itens vendidos' é SUM(item_quantidade).
+    - 'Quantidade de pedidos' é COUNT(DISTINCT numero).
+    - Para filtrar por um produto, junte 'vendas_detalhes' com 'produtos_2' (ON v.item_codigo = p.codigo) e filtre por 'p.sku_primario'.
+    - **NOVA REGRA:** Sempre que uma pergunta pedir uma análise 'por produto' (como 'produtos mais vendidos' ou 'faturamento por produto'), a agregação (GROUP BY) deve ser feita usando a coluna `p.sku_primario` e o nome (`p.nome`) da tabela `produtos_2` após o JOIN.
+
+    **Exemplo para Pergunta Comparativa:**
+    Pergunta: "compare o faturamento deste mês com o mês passado"
+    Sua Resposta:
+    {{
+      "query_periodo_recente": "SELECT SUM(valorBase) as valor FROM vendas_detalhes WHERE data BETWEEN DATE_FORMAT(CURDATE(), '%Y-%m-01') AND (CURDATE() - INTERVAL 1 DAY);",
+      "query_periodo_antigo": "SELECT SUM(valorBase) as valor FROM vendas_detalhes WHERE data BETWEEN DATE_FORMAT(CURDATE() - INTERVAL 1 MONTH, '%Y-%m-01') AND (DATE_FORMAT(CURDATE() - INTERVAL 1 MONTH, '%Y-%m-01') + INTERVAL (DAY(CURDATE()) - 2) DAY);"
+    }}
+
 
     **Esquema do Banco de Dados:**
     {esquema_texto}
@@ -322,7 +343,7 @@ def gerar_sql_com_ia(pergunta_usuario: str, esquema_bd: dict) -> str:
     **Pergunta do Usuário:**
     "{pergunta_usuario}"
 
-    **Consulta SQL Gerada:**
+    **Sua Resposta:**
     """
 
     print("\n--- Enviando pergunta e esquema para o Gemini gerar o SQL... ---")
@@ -428,56 +449,47 @@ def obter_vendas_produto_periodo(item_codigo: str, dias: int) -> float:
     else:
         return 0.0
 
-def calcular_demanda_por_sku_primario(dias: int) -> dict:
+def obter_dados_base_vendas(dias: int) -> pd.DataFrame:
     """
-    Busca todas as vendas, explode os kits e calcula a demanda total por sku_primario.
-    (VERSÃO CORRIGIDA)
+    Função 'motor' que busca os dados de vendas brutos, já com a lógica de
+    'explosão de kits', retornando um DataFrame não agregado.
     """
-    print(f"\n--- [MODO DEBUG] Calculando demanda para os últimos {dias} dias ---")
-    data_inicio = (datetime.now() - timedelta(days=dias)).strftime('%Y-%m-%d')
-    data_fim = datetime.now().strftime('%Y-%m-%d')
-
+    print(f"\n--- Buscando dados base de vendas dos últimos {dias} dias... ---")
+    hoje = datetime.now()
+    data_fim = (hoje - timedelta(days=1)).strftime('%Y-%m-%d')
+    data_inicio = (hoje - timedelta(days=dias)).strftime('%Y-%m-%d')
+    
     query = f"""
         SELECT 
-            v.item_codigo AS codigo_vendido, v.item_quantidade AS qtd_vendida,
-            p.sku_primario, p.quantidade AS qtd_no_kit
+            v.data,
+            p.sku_primario,
+            v.item_quantidade * IF(p.quantidade = 0, 1, p.quantidade) AS demanda_primario
         FROM 
             vendas_detalhes v
-        LEFT JOIN 
+        JOIN 
             produtos_2 p ON v.item_codigo = p.codigo
         WHERE 
             v.situacao_desc IN ('Aprovado', 'Em Aberto', 'Em andamento')
             AND v.data BETWEEN '{data_inicio}' AND '{data_fim}';
     """
-    df_vendas_bruto = executar_consulta(query)
-
-    if df_vendas_bruto is None or df_vendas_bruto.empty:
-        print("[DEBUG] Nenhuma venda encontrada no período de análise.")
-        return {}
-
-    df_vendas_validas = df_vendas_bruto.dropna(subset=['sku_primario'])
+    df_vendas_base = executar_consulta(query)
     
-    if df_vendas_validas.empty:
-        print("[AVISO] Nenhuma venda válida restante após remover itens não encontrados.")
+    return df_vendas_base if df_vendas_base is not None else pd.DataFrame()
+
+def calcular_demanda_por_sku_primario(df_vendas_base: pd.DataFrame) -> dict:
+    """
+    Recebe o DataFrame de vendas base e calcula a demanda total por SKU.
+    """
+    if df_vendas_base.empty:
         return {}
     
-    # --- CORREÇÃO AQUI ---
-    # Se a qtd_no_kit for 0, substituímos por 1.
-    # Isso garante que a venda de um produto unitário seja contada como 1x a quantidade vendida.
-    df_vendas_validas['qtd_no_kit'] = df_vendas_validas['qtd_no_kit'].replace(0, 1)
-
-    # "Explodindo" a demanda: qtd vendida * qtd de itens primários no kit
-    df_vendas_validas['demanda_primario'] = df_vendas_validas['qtd_vendida'] * df_vendas_validas['qtd_no_kit']
-
-    # Agrupando por sku_primario e somando a demanda total
-    df_demanda_final = df_vendas_validas.groupby('sku_primario')['demanda_primario'].sum()
-
-    print("\n--- [DEBUG] Cálculo de demanda finalizado ---")
+    df_demanda_final = df_vendas_base.groupby('sku_primario')['demanda_primario'].sum()
+    print("--- Cálculo de demanda a partir dos dados base finalizado ---")
     return df_demanda_final.to_dict()
 
 # --- MUDANÇA AQUI: Todas as chaves do dicionário em MAIÚSCULAS ---
 DADOS_FORNECEDORES = {
-    'SECALUX COMERCIO E INDUSTRIA LTDA': {'id': 11278695908, 'tempo_entrega': 15},
+    'SECALUX COMERCIO E INDUSTRIA LTDA': {'id': 11278695908, 'tempo_entrega': 20},
     'KAPAZI IND E COM DE CAPACHOS LTDA': {'id': 9428059227, 'tempo_entrega': 15},
     'BIG CLICK MAGAZINE E DISTRIBUIDORA LTDA.': {'id': 16968107306, 'tempo_entrega': 15},
     'VIEL INDÚSTRIA METALURGICA LTDA': {'id': 16379319220, 'tempo_entrega': 15},
@@ -497,20 +509,12 @@ def sugerir_compras(dry_run=True, fornecedores_selecionados=None):
     retornando um DataFrame para exibição na interface.
     """
     # ETAPA 1: Análise ABC para classificação estratégica
-    print("\n--- Etapa 1 de 4: Executando Análise de Curva ABC para classificação...")
-    hoje = datetime.now()
-    data_fim_abc = hoje.strftime('%Y-%m-%d')
-    data_inicio_abc = (hoje - timedelta(days=90)).strftime('%Y-%m-%d')
-    df_abc = analisar_curva_abc(data_inicio=data_inicio_abc, data_fim=data_fim_abc)
-    mapa_curva_abc = {}
-    if df_abc is not None:
-        mapa_curva_abc = df_abc.set_index('sku_primario')['curva_abc'].to_dict()
-    else:
-        print("AVISO: Análise ABC não retornou dados.")
+     # 1. Busca os dados base UMA VEZ SÓ
+    df_vendas_base = obter_dados_base_vendas(30)
 
     # ETAPA 2: Cálculo de Demanda
     print("\n--- Etapa 2 de 4: Calculando demanda de vendas por SKU primário...")
-    demanda_por_sku = calcular_demanda_por_sku_primario(30)
+    demanda_por_sku = calcular_demanda_por_sku_primario(df_vendas_base)
     if not demanda_por_sku:
         print("Análise encerrada por falta de dados de demanda.")
         return pd.DataFrame() # Retorna um DataFrame vazio
@@ -796,46 +800,47 @@ def criar_pedido_de_compra_api(nome_fornecedor: str, id_fornecedor: int, produto
     print(f"Falha ao criar o pedido para {nome_fornecedor} após todas as tentativas.")
     return False
 
-# A assinatura da função mudou para aceitar datas específicas
 def analisar_curva_abc(data_inicio: str, data_fim: str):
     """
-    Realiza a análise de Curva ABC dos produtos com base no faturamento para um período específico.
+    Realiza a análise de Curva ABC com base no faturamento por SKU PRIMÁRIO e garante
+    que o nome exibido seja o do produto primário.
     """
     print(f"\n--- Executando Análise ABC para o período de {data_inicio} a {data_fim} ---")
     
-    # A consulta agora usa as datas fornecidas em vez de calcular a partir de hoje
     query = f"""
-        SELECT 
-            p.sku_primario,
-            p.nome,
-            SUM(v.item_quantidade * p.precoCusto) as faturamento_custo
-        FROM 
-            vendas_detalhes v
-        JOIN 
-            produtos_2 p ON v.item_codigo = p.codigo
-        WHERE 
-            v.situacao_desc IN ('Aprovado', 'Em Aberto', 'Em andamento')
-            AND v.data BETWEEN '{data_inicio}' AND '{data_fim}'
-        GROUP BY 
-            p.sku_primario, p.nome
-        HAVING 
-            faturamento_custo > 0;
+        SELECT p.sku_primario, SUM(v.item_quantidade * p.precoCusto) as faturamento_custo
+        FROM vendas_detalhes v
+        JOIN produtos_2 p ON v.item_codigo = p.codigo
+        WHERE v.situacao_desc IN ('Aprovado', 'Em Aberto', 'Em andamento')
+          AND v.data BETWEEN '{data_inicio}' AND '{data_fim}'
+        GROUP BY p.sku_primario
+        HAVING faturamento_custo > 0;
     """
-    
     df = executar_consulta(query)
 
     if df is None or df.empty:
-        print("Não foram encontrados dados de faturamento para realizar a análise ABC no período especificado.")
+        print("Não foram encontrados dados para a análise ABC no período.")
         return None
 
-    # O resto da lógica de cálculo da curva continua exatamente o mesmo
+    # Pega a lista de SKUs primários que tiveram faturamento
+    skus_relevantes = tuple(df['sku_primario'].unique())
+    
+    # Busca os nomes "oficiais" desses SKUs primários
+    query_nomes = f"SELECT sku_primario, nome FROM produtos_2 WHERE sku_primario IN {skus_relevantes} AND codigo = sku_primario;"
+    df_nomes = executar_consulta(query_nomes)
+    
+    # Junta a informação do nome oficial com a de faturamento
+    if df_nomes is not None:
+        df = pd.merge(df, df_nomes, on='sku_primario')
+
+    # O resto da lógica da curva continua o mesmo
     df = df.sort_values(by='faturamento_custo', ascending=False)
     df['percentual'] = (df['faturamento_custo'] / df['faturamento_custo'].sum()) * 100
     df['percentual_acumulado'] = df['percentual'].cumsum()
 
-    def classificar_curva(percentual_acumulado):
-        if percentual_acumulado <= 80: return 'A'
-        elif percentual_acumulado <= 95: return 'B'
+    def classificar_curva(p):
+        if p <= 80: return 'A'
+        elif p <= 95: return 'B'
         else: return 'C'
 
     df['curva_abc'] = df['percentual_acumulado'].apply(classificar_curva)
@@ -850,12 +855,14 @@ def comparar_curva_abc(periodo_em_dias: int, curva_filtro: str = None):
     Compara a Curva ABC do período atual com o período anterior, 
     com opção de filtrar por uma curva específica. (VERSÃO CORRIGIDA E FINAL)
     """
-    hoje = datetime.now()
+    ontem = datetime.now() - timedelta(days=1)
     formato_sql = '%Y-%m-%d'
 
-    # --- Parte 1: Define os dois períodos de análise ---
-    data_fim_recente = hoje
-    data_inicio_recente = hoje - timedelta(days=periodo_em_dias)
+    # Período Recente (ex: os últimos 90 dias, terminando ontem)
+    data_fim_recente = ontem
+    data_inicio_recente = ontem - timedelta(days=periodo_em_dias)
+    
+    # Período Antigo (os 90 dias ANTES do período recente)
     data_fim_antigo = data_inicio_recente - timedelta(days=1)
     data_inicio_antigo = data_fim_antigo - timedelta(days=periodo_em_dias)
 
@@ -907,6 +914,215 @@ def comparar_curva_abc(periodo_em_dias: int, curva_filtro: str = None):
 
     # --- MUDANÇA AQUI: Adicione esta linha no final da função ---
     return df_relatorio_final
+
+def executar_analise_comparativa(pergunta: str):
+    """
+    Orquestra a análise comparativa. É flexível para lidar com respostas
+    JSON (comparativo) ou SQL simples da IA. (VERSÃO ROBUSTA)
+    """
+    esquema = obter_esquema_bd()
+    if not esquema:
+        return None
+
+    resposta_ia = gerar_sql_com_ia(pergunta, esquema)
+    
+    # Limpeza da resposta da IA para remover formatação de código
+    resposta_limpa = resposta_ia.strip().strip("`")
+    if resposta_limpa.lower().startswith("json"):
+        resposta_limpa = resposta_limpa[4:].strip()
+
+    # --- LÓGICA REESTRUTURADA ---
+    try:
+        # Tenta interpretar a resposta como JSON. Se falhar, pula para o 'except'.
+        queries = json.loads(resposta_limpa)
+        is_comparative = True
+    except json.JSONDecodeError:
+        is_comparative = False
+
+    # --- Execução baseada no tipo de resposta ---
+    if is_comparative:
+        print("DEBUG: IA retornou um JSON. Executando as duas queries...")
+        try:
+            df_recente = executar_consulta(queries['query_periodo_recente'])
+            df_antigo = executar_consulta(queries['query_periodo_antigo'])
+
+            if df_recente is None or df_antigo is None:
+                return pd.DataFrame()
+
+            # --- Lógica de cálculo dinâmica e robusta ---
+            # Pega o nome da última coluna (que é a de valor) dinamicamente
+            valor_col_name = df_recente.columns[-1]
+            # Pega todas as outras colunas (que são as de dimensão, ex: 'nome_loja')
+            dim_cols = list(df_recente.columns[:-1])
+
+            df_comparativo = pd.merge(df_recente, df_antigo, on=dim_cols, how='outer', suffixes=('_recente', '_antigo')).fillna(0)
+            
+            # Usa os nomes de coluna dinâmicos para o cálculo
+            valor_recente_col = f"{valor_col_name}_recente"
+            valor_antigo_col = f"{valor_col_name}_antigo"
+
+            # Adiciona proteção para evitar divisão por zero
+            denominador = df_comparativo[valor_antigo_col].replace(0, pd.NA)
+            df_comparativo['evolucao_%'] = round(
+                ((df_comparativo[valor_recente_col] - df_comparativo[valor_antigo_col]) / denominador) * 100, 2
+            ).fillna(100.0) # Se o valor antigo era 0, consideramos um crescimento de 100%
+
+            return df_comparativo
+        except KeyError as e:
+            print(f"DEBUG: Chave não encontrada no JSON: {e}")
+            return pd.DataFrame()
+    else:
+        # Se não for comparativo, executa como SQL simples
+        print("DEBUG: Executando como um SQL simples...")
+        return executar_consulta(resposta_limpa)
+
+def obter_historico_vendas_sku(df_vendas_base: pd.DataFrame, sku_primario: str):
+    """
+    Recebe o DataFrame de vendas base, filtra para um SKU específico e retorna a série temporal.
+    """
+    if df_vendas_base.empty:
+        return None
+
+    df_sku = df_vendas_base[df_vendas_base['sku_primario'] == sku_primario]
+
+    if df_sku.empty:
+        return None
+
+    df_historico = df_sku.groupby('data')['demanda_primario'].sum().reset_index()
+    df_historico = df_historico.rename(columns={'data': 'ds', 'demanda_primario': 'y'})
+    
+    print(f"DEBUG: Histórico preparado para {sku_primario}. Total de vendas no período: {df_historico['y'].sum()}")
+    return df_historico
+
+# Em agente_dados.py
+def gerar_previsao_vendas(sku_primario: str, dias_historico: int = 180, dias_previsao: int = 30):
+    """
+    Gera uma previsão de vendas para um SKU usando o Prophet e retorna os resultados em tabelas.
+    """
+    df_vendas_base = obter_dados_base_vendas(dias_historico)
+    df_historico = obter_historico_vendas_sku(df_vendas_base, sku_primario)
+    
+    if df_historico is None or len(df_historico) < 15:
+        print(f"Não há dados históricos suficientes para o SKU {sku_primario}.")
+        return None
+
+    m = Prophet(weekly_seasonality=True, daily_seasonality=False)
+    m.fit(df_historico)
+
+    future = m.make_future_dataframe(periods=dias_previsao)
+    forecast = m.predict(future)
+    
+    print(f"Previsão para {sku_primario} gerada com sucesso.")
+
+    df_previsao_futura = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail(dias_previsao)
+    
+    # Gera a explicação usando os dados da previsão
+    explicacao_texto = explicar_previsao_com_gemini(sku_primario, df_previsao_futura)
+
+    # Retorna um dicionário com as tabelas de dados e a explicação
+    return {
+        "historico_df": df_historico, # <-- NOVO: Retornando o histórico
+        "forecast_df": df_previsao_futura,
+        "explicacao": explicacao_texto
+    }
+
+def rotear_pergunta(pergunta_usuario: str) -> dict:
+    """
+    Usa o Gemini para classificar a pergunta do usuário e extrair parâmetros,
+    retornando um dicionário JSON. (VERSÃO ROBUSTA)
+    """
+    prompt = f"""
+    Você é um roteador de intenções inteligente. Analise a pergunta do usuário e a classifique, extraindo os parâmetros. Responda APENAS com um objeto JSON válido.
+
+    As intenções possíveis são:
+    - 'analise_abc_simples': Para qualquer pergunta que peça a Curva ABC de um período.
+    - 'analise_abc_comparativa': Para perguntas que peçam a comparação ou evolução da Curva ABC entre períodos.
+    - 'previsao_vendas': Para perguntas que solicitem uma previsão de vendas para um SKU específico.
+    - 'pergunta_aberta_sql': Para qualquer outra pergunta sobre dados, faturamento, vendas, produtos, etc., que precise de uma consulta SQL para ser respondida.
+
+    Os parâmetros possíveis são:
+    - 'periodo_dias' (em número)
+    - 'curva' (como 'A', 'B' ou 'C')
+    - 'sku_primario'
+
+    Exemplos:
+    - Pergunta: "qual a curva abc dos últimos 30 dias?" -> Sua Resposta: {{"intencao": "analise_abc_simples", "periodo_dias": 30}}
+    - Pergunta: "mostre a evolução da curva A" -> Sua Resposta: {{"intencao": "analise_abc_comparativa", "curva": "A"}}
+    - Pergunta: "qual o faturamento de ontem?" -> Sua Resposta: {{"intencao": "pergunta_aberta_sql"}}
+    - Pergunta: "qual a previsão de vendas do produto sec_varalravenna_preto?" -> Sua Resposta: {{"intencao": "previsao_vendas", "sku_primario": "sec_varalravenna_preto"}}
+
+    Pergunta do Usuário:
+    "{pergunta_usuario}"
+
+    Sua Resposta JSON:
+    """
+    try:
+        response = model.generate_content(prompt)
+        
+        # Limpa a resposta para extrair apenas o JSON
+        resposta_limpa = response.text.strip()
+        
+        # Encontra o início e o fim do JSON
+        inicio_json = resposta_limpa.find('{')
+        fim_json = resposta_limpa.rfind('}') + 1
+        
+        if inicio_json != -1 and fim_json != 0:
+            json_puro = resposta_limpa[inicio_json:fim_json]
+            # Tenta converter o JSON puro para um dicionário
+            return json.loads(json_puro)
+        else:
+            # Se não encontrar um JSON, retorna um dicionário de erro
+            print("AVISO: IA não retornou um JSON válido.")
+            return {"intencao": "erro_de_roteamento"}
+
+    except Exception as e:
+        print(f"Erro ao rotear pergunta: {e}")
+        # Em caso de qualquer outra falha, retorna um dicionário de erro
+        return {"intencao": "erro"}
+
+def explicar_previsao_com_gemini(sku: str, forecast_df: pd.DataFrame):
+    """
+    Usa o Gemini para analisar os resultados de uma previsão do Prophet e gerar um resumo em texto.
+    """
+    # Prepara os dados da previsão para serem enviados no prompt
+    dados_previsao_texto = forecast_df.to_string()
+    
+    # Extrai a tendência diretamente dos dados da previsão
+    valor_inicial_tendencia = forecast_df['yhat'].iloc[0]
+    valor_final_tendencia = forecast_df['yhat'].iloc[-1]
+    
+    if valor_final_tendencia > valor_inicial_tendencia:
+        direcao_tendencia = "de alta"
+    elif valor_final_tendencia < valor_inicial_tendencia:
+        direcao_tendencia = "de baixa"
+    else:
+        direcao_tendencia = "de estabilidade"
+
+    # Calcula o total previsto
+    total_previsto = forecast_df['yhat'].sum()
+
+    prompt = f"""
+    Você é um analista de dados sênior e sua tarefa é explicar uma previsão de vendas para um gerente de negócios.
+
+    **Contexto:**
+    - Produto (SKU): {sku}
+    - A previsão indica uma tendência geral {direcao_tendencia}.
+    - O total de vendas previsto para os próximos 30 dias é de aproximadamente {total_previsto:.0f} unidades.
+
+    **Dados da Previsão (yhat é o valor previsto):**
+    {dados_previsao_texto}
+
+    **Sua Tarefa:**
+    Escreva um parágrafo conciso e claro em português, explicando o que esses dados significam. Comece com a conclusão principal (o total previsto) e depois comente sobre a tendência. Use um tom profissional e direto.
+    """
+
+    print("Gerando explicação da previsão com Gemini...")
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        print(f"Erro ao gerar explicação: {e}")
+        return "Não foi possível gerar a explicação da análise."
 
 #if __name__ == '__main__':
     # print("--- INICIANDO AGENTE COM CAPACIDADE TEXT-TO-SQL ---")

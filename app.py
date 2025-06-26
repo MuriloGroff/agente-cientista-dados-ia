@@ -1,88 +1,167 @@
 import streamlit as st
 import pandas as pd
-import agente_dados as agente # Importa nosso "cérebro"
+import agente_dados as agente
 from datetime import datetime, timedelta
 
 # --- Configuração da Página ---
 st.set_page_config(page_title="Agente Cientista de Dados", page_icon="🤖", layout="wide")
 
-# --- Interface ---
-st.title("🤖 Agente Cientista de Dados")
-st.write("Sua interface inteligente para análise de negócios.")
-
-# Layout com abas para diferentes funcionalidades
-tab1, tab2, tab3 = st.tabs(["Análise Conversacional", "Sugestão de Compras", "Análise de Curva ABC"])
-
-# --- Aba 1: Análise Conversacional (Text-to-SQL) ---
-with tab1:
-    st.header("Faça uma Pergunta Aberta")
-    with st.form(key='form_pergunta'):
-        pergunta_sql = st.text_input("Digite sua pergunta sobre os dados:", placeholder="Ex: qual o faturamento de ontem?")
-        submit_sql = st.form_submit_button("Analisar Pergunta")
-
-    if submit_sql and pergunta_sql:
-        with st.spinner('Gerando e executando a consulta SQL...'):
-            esquema = agente.obter_esquema_bd()
-            if esquema:
-                sql_gerado = agente.gerar_sql_com_ia(pergunta_sql, esquema)
-                st.code(sql_gerado, language='sql')
-                df_resultado = agente.executar_consulta(sql_gerado)
-                if df_resultado is not None:
-                    st.dataframe(df_resultado)
-                    resumo = agente.resumir_resultados_com_gemini(df_resultado, pergunta_sql)
-                    st.success(resumo)
-                else:
-                    st.error("A consulta não pôde ser executada ou não retornou resultados.")
-
-# --- Aba 2: Sugestão de Compras ---
-with tab2:
-    st.header("Gerar Sugestões de Compra")
-    st.write("Esta análise calcula a necessidade de compra com base nas vendas dos últimos 30 dias e no tempo de entrega de cada fornecedor.")
-
-    # Pegamos a lista de nomes de fornecedores do nosso dicionário
-    lista_fornecedores = list(agente.DADOS_FORNECEDORES.keys())
-    fornecedores_selecionados = st.multiselect("Selecione um ou mais fornecedores para analisar (deixe em branco para todos):", options=lista_fornecedores)
+# ==============================================================================
+# --- BARRA LATERAL (SIDEBAR) PARA AÇÕES CRÍTICAS ---
+# ==============================================================================
+with st.sidebar:
+    st.title("Painel de Ações ⚙️")
+    st.write("Use esta área para ações que alteram ou criam dados no seu sistema.")
     
-    # Adiciona um botão de "cuidado" para o modo real
-    modo_real = st.toggle("Criar pedidos de compra reais no Bling (MODO REAL)")
+    st.header("Sugestão de Compras")
     
-    if st.button("Executar Sugestão de Compras"):
-        # Passamos a lista de fornecedores selecionados para a nossa função
-        with st.spinner("Analisando..."):
-            resultado_compras = agente.sugerir_compras(
-                dry_run=(not modo_real), 
-                fornecedores_selecionados=fornecedores_selecionados
-            )
-        
-        st.success("Análise concluída!")
-        if resultado_compras is not None and not resultado_compras.empty:
+    # Botão de segurança para o modo real
+    modo_real = st.toggle("Criar pedidos de compra reais no Bling")
+    
+    if st.button("Gerar Sugestão de Compras"):
+        if modo_real:
+            st.warning("MODO REAL ATIVADO: Criando pedidos no Bling...")
+            with st.spinner("Analisando e criando pedidos..."):
+                resultado_compras = agente.sugerir_compras(dry_run=False)
+            st.success("Processo finalizado!")
+            st.caption("Abaixo está o relatório dos pedidos que foram criados:")
             st.dataframe(resultado_compras)
         else:
-            st.info("Nenhuma sugestão de compra gerada para os filtros selecionados.")
+            st.info("MODO DE SIMULAÇÃO: Nenhum pedido será criado.")
+            with st.spinner("Analisando em modo de simulação..."):
+                resultado_compras = agente.sugerir_compras(dry_run=True)
+            st.success("Simulação concluída!")
+            st.caption("Abaixo está o relatório de sugestões:")
+            st.dataframe(resultado_compras)
 
-# --- Aba 3: Análise de Curva ABC ---
-with tab3:
-    st.header("Análise de Curva ABC e Evolução")
-    
-    periodo_abc = st.number_input("Analisar os últimos (dias):", min_value=30, max_value=365, value=90, step=30)
-    
-    if st.button("Rodar Análise ABC Simples"):
-        with st.spinner(f"Calculando Curva ABC para os últimos {periodo_abc} dias..."):
-            hoje = datetime.now()
-            data_fim = hoje.strftime('%Y-%m-%d')
-            data_inicio = (hoje - timedelta(days=periodo_abc)).strftime('%Y-%m-%d')
-            df_abc = agente.analisar_curva_abc(data_inicio, data_fim)
+# ==============================================================================
+# --- INTERFACE PRINCIPAL DO CHAT ---
+# ==============================================================================
+st.title("🤖 Converse com seu Agente de Dados")
+
+# Inicializa o histórico do chat na memória da sessão
+if "messages" not in st.session_state:
+    st.session_state.messages = [{"role": "assistant", "content": "Olá! Sou seu agente de dados. Em que posso ajudar hoje?"}]
+
+# Exibe as mensagens antigas do histórico
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        # Se a mensagem tiver uma tabela de dados, exibe também
+        if "data" in message and isinstance(message["data"], pd.DataFrame):
+            st.dataframe(message["data"])
+
+if prompt := st.chat_input("Qual a sua análise de hoje?"):
+    # Adiciona e exibe a mensagem do usuário
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    # O Agente "pensa" e responde
+    with st.chat_message("assistant"):
+        resposta_container = st.empty()
+        with st.spinner("Analisando sua pergunta..."):
+            # 1. Roteador de intenções decide o que fazer
+            analise_roteador = agente.rotear_pergunta(prompt)
+            intencao = analise_roteador.get("intencao", "erro")
+            resposta_container.info(f"Intenção detectada: `{intencao}`. Processando...")
+
+        # 2. Executa a ação correta com base na intenção E nos parâmetros
+        if intencao == "analise_abc_simples":
+            # Pega os parâmetros da análise do Gemini, com valores padrão de 90 dias
+            periodo = analise_roteador.get("periodo_dias", 90)
+            curva_filtro = analise_roteador.get("curva")
+
+            with st.spinner(f"Calculando Curva ABC para os últimos {periodo} dias..."):
+                hoje = datetime.now()
+                data_fim = (hoje - timedelta(days=1)).strftime('%Y-%m-%d')
+                # CORREÇÃO: Usa a variável 'periodo' em vez de 90 fixo
+                data_inicio = (hoje - timedelta(days=periodo)).strftime('%Y-%m-%d')
+                df_resultado = agente.analisar_curva_abc(data_inicio, data_fim)
+
+            st.success("Análise ABC Concluída!")
+            
+            if df_resultado is not None:
+                df_para_exibir = df_resultado.copy()
+                
+                # --- LÓGICA DE FILTRO DA CURVA ---
+                if curva_filtro:
+                    curva_filtro = curva_filtro.upper()
+                    st.write(f"Filtrando resultados para a Curva: **{curva_filtro}**")
+                    df_para_exibir = df_resultado[df_resultado['curva_abc'] == curva_filtro]
+                
+                if df_para_exibir.empty:
+                    st.warning(f"Nenhum produto encontrado para a Curva '{curva_filtro}' nesse período.")
+                else:
+                    st.dataframe(df_para_exibir)
+
+                st.write("Resumo da contagem geral por curva:")
+                st.write(df_resultado['curva_abc'].value_counts())
+                st.session_state.messages.append({"role": "assistant", "content": f"Aqui está a Análise de Curva ABC para os últimos {periodo} dias:", "data": df_para_exibir})
+            else:
+                st.error("Não foi possível gerar a Análise ABC.")
+                st.session_state.messages.append({"role": "assistant", "content": "Não foi possível gerar a Análise ABC."})
+
+
+        elif intencao == "analise_abc_comparativa":
+            with st.spinner(f"Comparando Curvas ABC..."):
+                periodo = analise_roteador.get("periodo_dias", 90)
+                curva_filtro = analise_roteador.get("curva")
+                df_resultado = agente.comparar_curva_abc(periodo_em_dias=periodo, curva_filtro=curva_filtro)
+
+            if df_resultado is not None and not df_resultado.empty:
+                resposta_container.success("Análise Comparativa Concluída!")
+                st.dataframe(df_resultado)
+                st.session_state.messages.append({"role": "assistant", "content": "Aqui está a sua Análise Comparativa de Curva ABC:", "data": df_resultado})
+            else:
+                 resposta_container.info("Nenhuma mudança de curva detectada para os critérios especificados.")
+                 st.session_state.messages.append({"role": "assistant", "content": "Nenhuma mudança de curva detectada para os critérios especificados."})
         
-        st.success("Análise ABC concluída!")
-        if df_abc is not None:
-            st.dataframe(df_abc)
-            st.write("Resumo da contagem por curva:")
-            st.write(df_abc['curva_abc'].value_counts())
+        elif intencao == "previsao_vendas":
+            sku = analise_roteador.get("sku_primario")
+            if sku:
+                with st.spinner(f"Gerando previsão para o SKU '{sku}'..."):
+                    resultado_previsao = agente.gerar_previsao_vendas(sku)
+                
+                if resultado_previsao:
+                    st.success("Previsão gerada com sucesso!")
+                    
+                    # 1. Mostra a explicação da IA primeiro
+                    st.subheader("💡 Resumo da Análise Preditiva")
+                    st.info(resultado_previsao['explicacao'])
+                    
+                    # 2. Mostra os dados históricos que alimentaram o modelo
+                    st.subheader("Dados Históricos Usados para o Treino do Modelo")
+                    st.dataframe(resultado_previsao['historico_df'])
 
-    if st.button("Rodar Análise ABC Comparativa"):
-        with st.spinner(f"Comparando os últimos {periodo_abc} dias com o período anterior..."):
-            df_comparativo = agente.comparar_curva_abc(periodo_em_dias=periodo_abc)
+                    # 3. Mostra a tabela com a previsão para o futuro
+                    st.subheader(f"Tabela de Previsão (Próximos 30 dias)")
+                    st.dataframe(resultado_previsao['forecast_df'])
 
-        st.success("Análise Comparativa concluída!")
-        if df_comparativo is not None:
-            st.dataframe(df_comparativo)
+                    # Adiciona a explicação ao histórico do chat
+                    st.session_state.messages.append({"role": "assistant", "content": resultado_previsao['explicacao']})
+                else:
+                    msg_erro = f"Não foi possível gerar a previsão para o SKU '{sku}'. Verifique se o SKU está correto e possui vendas históricas suficientes."
+                    st.error(msg_erro)
+                    st.session_state.messages.append({"role": "assistant", "content": msg_erro})
+            else:
+                msg_aviso = "Para gerar uma previsão, por favor, especifique o SKU do produto na sua pergunta. Ex: 'previsão para o produto XYZ'"
+                st.warning(msg_aviso)
+                st.session_state.messages.append({"role": "assistant", "content": msg_aviso})
+
+        elif intencao == "pergunta_aberta_sql":
+            with st.spinner("Gerando SQL e buscando dados..."):
+                df_resultado = agente.executar_analise_comparativa(prompt) # Reutilizamos esta função que lida com SQL
+            
+            if df_resultado is not None and not df_resultado.empty:
+                resposta_container.success("Análise Concluída!")
+                st.dataframe(df_resultado)
+                resumo = agente.resumir_resultados_com_gemini(df_resultado, prompt)
+                st.success(resumo)
+                st.session_state.messages.append({"role": "assistant", "content": resumo, "data": df_resultado})
+            else:
+                resposta_container.error("Não foi possível executar a análise ou não há dados para a sua pergunta.")
+                st.session_state.messages.append({"role": "assistant", "content": "Não foi possível executar a análise ou não há dados para a sua pergunta."})
+        else:
+            st.error("Desculpe, não consegui entender ou processar sua solicitação.")
+            st.session_state.messages.append({"role": "assistant", "content": "Desculpe, não consegui entender ou processar sua solicitação."})
